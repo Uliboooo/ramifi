@@ -1,0 +1,13 @@
+[package]
+name = "ramifi"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.30"
+egui = "0.30"
+egui_extras = "0.30"
+local_issues_lib = "0.18.0"
+easy_storage = "0.4"
+chrono = "0.4"
+serde = { version = "1.0", features = ["derive"] }
