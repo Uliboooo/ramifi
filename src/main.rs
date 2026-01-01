@@ -12,8 +12,8 @@ use std::fs;
 #[derive(PartialEq)]
 enum FilterStatus {
     Open,
-    Closed,     // "CloseAsCmp" (完了) を対象
-    NotPlanned, // "CloseAsNotPlaned" (計画なし) を対象
+    Closed,     // "CloseAsCmp"
+    NotPlanned, // "CloseAsNotPlaned"
     All,
 }
 
@@ -22,14 +22,11 @@ impl FilterStatus {
         match (self, status) {
             (FilterStatus::Open, Status::Open) => true,
             (FilterStatus::Open, _) => false,
-
             (FilterStatus::Closed, Status::CloseAsCmp) => true,
             (FilterStatus::Closed, Status::CloseAsForked) => true,
             (FilterStatus::Closed, _) => false,
-
             (FilterStatus::NotPlanned, Status::CloseAsNotPlaned) => true,
             (FilterStatus::NotPlanned, _) => false,
-
             (FilterStatus::All, _) => true,
         }
     }
@@ -54,14 +51,15 @@ struct RamifiApp {
     comment_drafts: HashMap<usize, String>,
     filter_status: FilterStatus,
     query: String,
-    scroll_to_issue: Option<usize>, // 追加: ジャンプ先のIssue ID (内部インデックス)
+
+    // 選択中のIssue ID (Noneの場合は何も選択されていない)
+    selected_issue_index: Option<usize>,
 
     current_user: User,
 }
 
 impl RamifiApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // OSの日本語フォント設定
         Self::setup_custom_fonts(&cc.egui_ctx);
 
         // ユーザー初期化
@@ -99,14 +97,13 @@ impl RamifiApp {
             comment_drafts: HashMap::new(),
             filter_status: FilterStatus::Open,
             query: String::new(),
-            scroll_to_issue: None,
+            selected_issue_index: Some(0), // 最初は一番上を選択状態に
             current_user,
         }
     }
 
     fn setup_custom_fonts(ctx: &egui::Context) {
         use eframe::egui::{FontData, FontDefinitions, FontFamily};
-
         let mut fonts = FontDefinitions::default();
         let font_candidates = [
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
@@ -146,7 +143,7 @@ impl RamifiApp {
 
 impl eframe::App for RamifiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // --- ユーザーマネージャー ウィンドウ ---
+        // --- User Manager Window ---
         if self.show_user_manager {
             egui::Window::new("User Manager")
                 .open(&mut self.show_user_manager)
@@ -164,7 +161,6 @@ impl eframe::App for RamifiApp {
                             }
                         });
                     }
-
                     ui.separator();
                     ui.heading("Add New User");
                     ui.horizontal(|ui| {
@@ -175,7 +171,6 @@ impl eframe::App for RamifiApp {
                         ui.label("Email:");
                         ui.text_edit_singleline(&mut self.new_user_email);
                     });
-
                     if ui.button("Create").clicked() {
                         if !self.new_user_name.is_empty() && !self.new_user_email.is_empty() {
                             let new_u = User::new(&self.new_user_name, &self.new_user_email);
@@ -187,175 +182,312 @@ impl eframe::App for RamifiApp {
                 });
         }
 
-        // --- トップパネル ---
+        // --- Top Panel (User Info & Global Menu) ---
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(format!("Current User: {}", self.current_user.name()));
-                if ui.button("Manage Users").clicked() {
-                    self.show_user_manager = true;
-                }
+                ui.label(
+                    egui::RichText::new("Ramifi Issue Tracker")
+                        .strong()
+                        .size(16.0),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Manage Users").clicked() {
+                        self.show_user_manager = true;
+                    }
+                    ui.label(format!("User: {}", self.current_user.name()));
+                });
             });
         });
 
-        // --- メインパネル ---
+        // --- Left Side Panel (Issue List) ---
+        egui::SidePanel::left("issue_list_panel")
+            .resizable(true)
+            .default_width(250.0)
+            .show(ctx, |ui| {
+                ui.add_space(5.0);
+
+                // New Issue Input
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut self.new_description)
+                        .request_focus();
+                    if ui.button("New").clicked() && !self.new_description.is_empty() {
+                        let mut issue = Issue::new(
+                            &self.new_description,
+                            self.current_user.clone(),
+                            vec![] as Vec<String>,
+                        );
+                        issue.comment(Comment::new(
+                            self.new_description.clone(),
+                            self.current_user.clone(),
+                        ));
+                        let new_index = self.issues.add_new_issue(issue);
+                        self.new_description.clear();
+                        self.selected_issue_index = Some(new_index); // 新規作成したらそれを選択
+                    }
+                });
+
+                ui.separator();
+
+                // Filters
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.filter_status, FilterStatus::Open, "Open");
+                    ui.selectable_value(&mut self.filter_status, FilterStatus::Closed, "Closed");
+                    ui.selectable_value(&mut self.filter_status, FilterStatus::All, "All");
+                });
+                ui.text_edit_singleline(&mut self.query)
+                    .on_hover_text("Search issues...");
+
+                ui.separator();
+
+                // Issue List ScrollArea
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    let all_issues = self.issues.get_list();
+                    let mut display_issues: Vec<(usize, Issue)> = all_issues
+                        .iter()
+                        .enumerate()
+                        .map(|(i, issue)| (i, issue.clone()))
+                        .collect();
+
+                    // Filter
+                    display_issues.retain(|(_, issue)| self.filter_status.matches(issue.status()));
+                    // Search
+                    if !self.query.is_empty() {
+                        let query = self.query.to_lowercase();
+                        display_issues
+                            .retain(|(_, issue)| issue.name().to_lowercase().contains(&query));
+                    }
+
+                    // Sort (Newest first)
+                    display_issues.sort_by(|a, b| b.0.cmp(&a.0));
+
+                    for (id, issue) in display_issues {
+                        let is_selected = self.selected_issue_index == Some(id);
+
+                        // ステータスアイコンの決定
+                        let (icon, color) = match issue.status() {
+                            Status::Open => ("🟢", egui::Color32::GREEN),
+                            Status::CloseAsCmp => ("🔴", egui::Color32::RED),
+                            Status::CloseAsNotPlaned => ("⚪", egui::Color32::GRAY),
+                            Status::CloseAsForked => ("🔵", egui::Color32::BLUE),
+                        };
+
+                        let label = format!("{} #{} {}", icon, id + 1, issue.name());
+
+                        if ui.selectable_label(is_selected, label).clicked() {
+                            self.selected_issue_index = Some(id);
+                        }
+                    }
+                });
+            });
+
+        // --- Central Panel (Issue Detail) ---
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Ramifi Issue Tracker");
+            if let Some(id) = self.selected_issue_index {
+                // IDが範囲外になっていないかチェック (削除機能がないので基本大丈夫だが念のため)
+                if let Some(issue) = self.issues.get(id).cloned() {
+                    // Cloneして描画に使う
+                    // --- Header Area ---
+                    ui.horizontal(|ui| {
+                        ui.heading(format!("{} #{}", issue.name(), id + 1));
 
-            // --- 新規作成 ---
-            ui.horizontal(|ui| {
-                ui.label("New Issue:");
-                ui.text_edit_singleline(&mut self.new_description);
-                if ui.button("Add").clicked() && !self.new_description.is_empty() {
-                    let mut issue = Issue::new(
-                        &self.new_description,
-                        self.current_user.clone(),
-                        vec![] as Vec<String>,
-                    );
-                    issue.comment(Comment::new(
-                        self.new_description.clone(),
-                        self.current_user.clone(),
-                    ));
-                    self.issues.add_new_issue(issue);
-                    self.new_description.clear();
-                }
-            });
+                        let (status_text, status_bg) = match issue.status() {
+                            Status::Open => (" Open ", egui::Color32::from_rgb(46, 160, 67)), // GitHub Green
+                            Status::CloseAsCmp => {
+                                (" Completed ", egui::Color32::from_rgb(130, 80, 223))
+                            } // GitHub Purple
+                            Status::CloseAsNotPlaned => (" Not Planned ", egui::Color32::GRAY),
+                            Status::CloseAsForked => (" Forked ", egui::Color32::BLUE),
+                        };
 
-            ui.separator();
+                        ui.add(egui::Label::new(
+                            egui::RichText::new(status_text)
+                                .color(egui::Color32::WHITE)
+                                .background_color(status_bg)
+                                .strong(),
+                        ));
 
-            // --- フィルタリング ---
-            ui.horizontal(|ui| {
-                ui.label("Filter:");
-                ui.radio_value(&mut self.filter_status, FilterStatus::Open, "Open");
-                ui.radio_value(&mut self.filter_status, FilterStatus::Closed, "Closed");
-                ui.radio_value(
-                    &mut self.filter_status,
-                    FilterStatus::NotPlanned,
-                    "Not Planned",
-                );
-                ui.radio_value(&mut self.filter_status, FilterStatus::All, "All");
-
-                ui.add_space(20.0);
-                ui.label("Search:");
-                ui.text_edit_singleline(&mut self.query);
-            });
-
-            ui.separator();
-
-            // --- リスト表示 ---
-            let all_issues = self.issues.get_list();
-            let mut display_issues: Vec<(usize, Issue)> = all_issues
-                .iter()
-                .enumerate()
-                .map(|(i, issue)| (i, issue.clone()))
-                .collect();
-
-            display_issues.retain(|(_, issue)| self.filter_status.matches(issue.status()));
-
-            if !self.query.is_empty() {
-                let query = self.query.to_lowercase();
-                display_issues.retain(|(_, issue)| issue.name().to_lowercase().contains(&query));
-            }
-
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for (id, issue) in display_issues {
-                    // グループ化してレスポンスを取得
-                    let group_response = ui.group(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.heading(format!("#{} {}", id + 1, issue.name()));
-
-                            let (status_text, status_color) = match issue.status() {
-                                Status::Open => ("Open", egui::Color32::GREEN),
-                                Status::CloseAsCmp => ("Completed", egui::Color32::RED),
-                                Status::CloseAsNotPlaned => ("Not Planned", egui::Color32::GRAY),
-                                Status::CloseAsForked => ("Forked", egui::Color32::BLUE),
-                            };
-                            ui.colored_label(status_color, status_text);
-
-                            // --- Fork元の表示 ---
-                            // from_index() が 0 でない場合は Fork された Issue とみなす
-                            if issue.from_index() != 0 {
-                                // 表示用IDは 内部index + 1
-                                let parent_display_id = issue.from_index() + 1;
-                                if ui
-                                    .link(format!("Forked from #{}", parent_display_id))
-                                    .clicked()
-                                {
-                                    // リンククリック時の動作:
-                                    // 1. フィルタを All にして隠れているIssueも表示
-                                    self.filter_status = FilterStatus::All;
-                                    // 2. スクロールターゲットを設定
-                                    self.scroll_to_issue = Some(issue.from_index());
-                                }
+                        if issue.from_index() != 0 {
+                            let parent_display_id = issue.from_index() + 1;
+                            if ui
+                                .link(format!("Forked from #{}", parent_display_id))
+                                .clicked()
+                            {
+                                self.filter_status = FilterStatus::All;
+                                self.selected_issue_index = Some(issue.from_index());
                             }
-
-                            if ui.button("Fork").clicked() {
-                                if let Some(new_id) = self.issues.fork(id) {
-                                    println!("Forked issue #{} to #{}", id, new_id);
-                                }
-                            }
-
-                            ui.menu_button("Close as ...", |ui| {
-                                if ui.button("Close (Completed)").clicked() {
-                                    if let Some(target) = self.issues.get_mut(id) {
-                                        target.close_as_cmp();
-                                    }
-                                    ui.close_menu();
-                                }
-                                if ui.button("Close (Not Planned)").clicked() {
-                                    if let Some(target) = self.issues.get_mut(id) {
-                                        target.close_as_not_planed();
-                                    }
-                                    ui.close_menu();
-                                }
-                            });
-
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        egui::RichText::new(issue.created_at().to_string()).weak(),
-                                    );
-                                },
-                            );
-                        });
-
-                        ui.separator();
-
-                        for comment in issue.comments() {
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new(comment.author().name()).strong());
-                                ui.label(comment.text());
-                            });
                         }
 
-                        ui.separator();
-
-                        ui.horizontal(|ui| {
-                            let draft_text = self.comment_drafts.entry(id).or_default();
-                            ui.text_edit_singleline(draft_text);
-
-                            if ui.button("Comment").clicked() && !draft_text.is_empty() {
-                                if let Some(target_issue) = self.issues.get_mut(id) {
-                                    target_issue.comment(Comment::new(
-                                        draft_text.clone(),
-                                        self.current_user.clone(),
-                                    ));
-                                    draft_text.clear();
-                                }
-                            }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    issue.created_at().format("%Y-%m-%d %H:%M").to_string(),
+                                )
+                                .weak(),
+                            );
                         });
                     });
 
-                    // 自動スクロール処理
-                    if self.scroll_to_issue == Some(id) {
-                        group_response
-                            .response
-                            .scroll_to_me(Some(egui::Align::Center));
-                        // スクロール完了後にターゲットをリセット
-                        self.scroll_to_issue = None;
-                    }
+                    ui.separator();
+
+                    // --- 2-Column Layout (Main Content vs Sidebar) ---
+                    let available_width = ui.available_width();
+                    let sidebar_width = 200.0;
+                    let main_content_width = available_width - sidebar_width - 20.0;
+
+                    ui.horizontal_top(|ui| {
+                        // --- Main Column (Comments & Timeline) ---
+                        ui.allocate_ui(
+                            egui::vec2(main_content_width, ui.available_height()),
+                            |ui| {
+                                egui::ScrollArea::vertical()
+                                    .id_source("main_scroll") // IDを固定してScroll状態を維持
+                                    .show(ui, |ui| {
+                                        for (i, comment) in issue.comments().iter().enumerate() {
+                                            // Comment Box Style
+                                            egui::Frame::group(ui.style()).inner_margin(8.0).show(
+                                                ui,
+                                                |ui| {
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(
+                                                            egui::RichText::new(
+                                                                comment.author().name(),
+                                                            )
+                                                            .strong(),
+                                                        );
+                                                        ui.label(
+                                                            egui::RichText::new(
+                                                                comment
+                                                                    .date()
+                                                                    .format("%Y-%m-%d %H:%M")
+                                                                    .to_string(),
+                                                            )
+                                                            .weak()
+                                                            .size(10.0),
+                                                        );
+                                                    });
+                                                    ui.separator();
+                                                    ui.label(comment.text());
+                                                },
+                                            );
+                                            ui.add_space(8.0);
+                                        }
+
+                                        ui.add_space(10.0);
+                                        ui.separator();
+                                        ui.label(egui::RichText::new("Add a comment").strong());
+
+                                        let draft_text = self.comment_drafts.entry(id).or_default();
+                                        ui.add(
+                                            egui::TextEdit::multiline(draft_text)
+                                                .desired_width(f32::INFINITY)
+                                                .hint_text("Leave a comment"),
+                                        );
+
+                                        ui.horizontal(|ui| {
+                                            if ui.button("Comment").clicked()
+                                                && !draft_text.is_empty()
+                                            {
+                                                if let Some(target_issue) = self.issues.get_mut(id)
+                                                {
+                                                    target_issue.comment(Comment::new(
+                                                        draft_text.clone(),
+                                                        self.current_user.clone(),
+                                                    ));
+                                                    draft_text.clear();
+                                                }
+                                            }
+
+                                            // Close button next to comment (GitHub style)
+                                            match issue.status() {
+                                                Status::Open => {
+                                                    if ui.button("Close issue").clicked() {
+                                                        if let Some(target) =
+                                                            self.issues.get_mut(id)
+                                                        {
+                                                            target.close_as_cmp();
+                                                        }
+                                                    }
+                                                }
+                                                _ => {
+                                                    // Reopen button placeholder (API不足のため未実装)
+                                                    ui.add_enabled(
+                                                        false,
+                                                        egui::Button::new("Reopen issue"),
+                                                    );
+                                                }
+                                            }
+                                        });
+                                    });
+                            },
+                        );
+
+                        ui.add_space(10.0);
+
+                        // --- Sidebar (Metadata & Actions) ---
+                        ui.allocate_ui(egui::vec2(sidebar_width, ui.available_height()), |ui| {
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                ui.heading("Settings");
+                                ui.separator();
+
+                                ui.label(egui::RichText::new("Status").strong());
+                                egui::ComboBox::from_id_source("status_combo")
+                                    .selected_text(format!("{:?}", issue.status()))
+                                    .show_ui(ui, |ui| {
+                                        if ui
+                                            .selectable_label(false, "Close as Completed")
+                                            .clicked()
+                                        {
+                                            if let Some(target) = self.issues.get_mut(id) {
+                                                target.close_as_cmp();
+                                            }
+                                        }
+                                        if ui
+                                            .selectable_label(false, "Close as Not Planned")
+                                            .clicked()
+                                        {
+                                            if let Some(target) = self.issues.get_mut(id) {
+                                                target.close_as_not_planed();
+                                            }
+                                        }
+                                    });
+
+                                ui.add_space(10.0);
+                                ui.label(egui::RichText::new("Actions").strong());
+                                if ui.button("Fork this issue").clicked() {
+                                    if let Some(new_id) = self.issues.fork(id) {
+                                        self.filter_status = FilterStatus::All;
+                                        self.selected_issue_index = Some(new_id);
+                                    }
+                                }
+
+                                ui.add_space(10.0);
+                                ui.label(egui::RichText::new("Labels").strong());
+                                // Label表示 (データ構造上は文字列配列)
+                                for label in issue.get_labels() {
+                                    ui.add(egui::Label::new(
+                                        egui::RichText::new(label)
+                                            .color(egui::Color32::BLACK)
+                                            .background_color(egui::Color32::LIGHT_GRAY),
+                                    ));
+                                }
+                                if issue.get_labels().is_empty() {
+                                    ui.label("None yet");
+                                }
+                            });
+                        });
+                    });
+                } else {
+                    // IDが無効な場合 (基本ありえないが)
+                    ui.centered_and_justified(|ui| {
+                        ui.label("Issue not found.");
+                    });
                 }
-            });
+            } else {
+                // 何も選択されていない場合
+                ui.centered_and_justified(|ui| {
+                    ui.label("Select an issue from the list to view details.");
+                });
+            }
         });
     }
 }
