@@ -7,7 +7,7 @@ edition = "2024"
 eframe = "0.33"
 egui = "0.33"
 egui_extras = "0.33"
-local_issues_lib = "0.20.0"
+local_issues_lib = "0.23.0"
 easy_storage = "0.4"
 chrono = "0.4"
 serde = { version = "1.0", features = ["derive"] }
