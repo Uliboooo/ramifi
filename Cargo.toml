@@ -11,3 +11,13 @@ local_issues_lib = "0.23.0"
 easy_storage = "0.4"
 chrono = "0.4"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+log = "0.4"
+rfd = "0.15"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+console_error_panic_hook = "0.1"
+tracing-wasm = "0.2"
+web-sys = { version = "0.3", features = ["Window", "Document", "HtmlCanvasElement", "Element"] }
+wasm-bindgen-futures = "0.4"

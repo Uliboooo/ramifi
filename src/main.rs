@@ -3,13 +3,19 @@ use local_issues_lib::{
     Comment, Issue, Issues, Status,
     user::{User, Users},
 };
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs;
+use std::sync::mpsc::{Receiver, Sender, channel};
+
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::JsCast;
 
 // ----------------------------------------------------------------------------
 // 1. define filtering
 // ----------------------------------------------------------------------------
-#[derive(PartialEq)]
+#[derive(PartialEq, Deserialize, Serialize)]
 enum FilterStatus {
     Open,
     Completed,  // "CloseAsCmp"
@@ -35,33 +41,45 @@ impl FilterStatus {
 // ----------------------------------------------------------------------------
 // 2. アプリケーション構造体
 // ----------------------------------------------------------------------------
+#[derive(Deserialize, Serialize)]
+#[serde(default)]
 struct RamifiApp {
     issues: Issues,
     users: Users,
 
     // UI State
+    #[serde(skip)]
     new_description: String,
 
     // User Manager UI State
+    #[serde(skip)]
     show_user_manager: bool,
+    #[serde(skip)]
     new_user_name: String,
+    #[serde(skip)]
     new_user_email: String,
 
     // Navigation / Action State
+    #[serde(skip)]
     comment_drafts: HashMap<usize, String>,
     filter_status: FilterStatus,
+    #[serde(skip)]
     query: String,
 
     // 選択中のIssue ID
+    #[serde(skip)]
     selected_issue_index: Option<usize>,
 
     current_user: User,
+
+    #[serde(skip)]
+    import_rx: Option<Receiver<RamifiApp>>,
+    #[serde(skip)]
+    import_tx: Option<Sender<RamifiApp>>,
 }
 
-impl RamifiApp {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        Self::setup_custom_fonts(&cc.egui_ctx);
-
+impl Default for RamifiApp {
+    fn default() -> Self {
         let mut users = Users::new();
         let default_user = User::new("coyuki", "coyuki@example.com");
         users.add_user(default_user.clone());
@@ -85,6 +103,8 @@ impl RamifiApp {
         issue3.comment(Comment::new("見た目を良くする", current_user.clone()));
         issues.add_new_issue(issue3);
 
+        let (tx, rx) = channel();
+
         Self {
             issues,
             users,
@@ -97,9 +117,30 @@ impl RamifiApp {
             query: String::new(),
             selected_issue_index: Some(0),
             current_user,
+            import_rx: Some(rx),
+            import_tx: Some(tx),
         }
     }
+}
 
+impl RamifiApp {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        Self::setup_custom_fonts(&cc.egui_ctx);
+
+        if let Some(storage) = cc.storage
+            && let Some(json) = storage.get_string(eframe::APP_KEY)
+            && let Ok(mut app) = serde_json::from_str::<Self>(&json)
+        {
+            let (tx, rx) = channel();
+            app.import_rx = Some(rx);
+            app.import_tx = Some(tx);
+            return app;
+        }
+
+        Self::default()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn setup_custom_fonts(ctx: &egui::Context) {
         use eframe::egui::{FontData, FontDefinitions, FontFamily};
         let mut fonts = FontDefinitions::default();
@@ -137,10 +178,35 @@ impl RamifiApp {
         }
         eprintln!("Japanese font not found in standard paths.");
     }
+
+    #[cfg(target_arch = "wasm32")]
+    fn setup_custom_fonts(_ctx: &egui::Context) {
+        // WebAssembly specific font setup can go here if needed.
+        // For now, we rely on default fonts or web fonts loaded via CSS.
+        println!("Running in WebAssembly mode.");
+    }
 }
 
+// ... existing App impl ...
+
 impl eframe::App for RamifiApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        if let Ok(json) = serde_json::to_string(self) {
+            storage.set_string(eframe::APP_KEY, json);
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(rx) = &self.import_rx
+            && let Ok(new_app) = rx.try_recv()
+        {
+            self.issues = new_app.issues;
+            self.users = new_app.users;
+            self.current_user = new_app.current_user;
+            self.filter_status = new_app.filter_status;
+            self.selected_issue_index = None;
+        }
+
         // --- User Manager Window ---
         if self.show_user_manager {
             egui::Window::new("User Manager")
@@ -190,6 +256,55 @@ impl eframe::App for RamifiApp {
                         .size(16.0),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Import").clicked()
+                        && let Some(tx) = self.import_tx.clone()
+                    {
+                        #[cfg(target_arch = "wasm32")]
+                        wasm_bindgen_futures::spawn_local(async move {
+                            if let Some(file) = rfd::AsyncFileDialog::new().pick_file().await {
+                                let data = file.read().await;
+                                if let Ok(app) = serde_json::from_slice::<RamifiApp>(&data) {
+                                    let _ = tx.send(app);
+                                }
+                            }
+                        });
+
+                        #[cfg(not(target_arch = "wasm32"))]
+                        std::thread::spawn(move || {
+                            if let Some(path) = rfd::FileDialog::new().pick_file()
+                                && let Ok(content) = std::fs::read_to_string(path)
+                                && let Ok(app) = serde_json::from_str::<RamifiApp>(&content)
+                            {
+                                let _ = tx.send(app);
+                            }
+                        });
+                    }
+
+                    if ui.button("Export").clicked()
+                        && let Ok(json) = serde_json::to_string_pretty(self)
+                    {
+                        #[cfg(target_arch = "wasm32")]
+                        wasm_bindgen_futures::spawn_local(async move {
+                            if let Some(handle) = rfd::AsyncFileDialog::new()
+                                .set_file_name("ramifi_export.json")
+                                .save_file()
+                                .await
+                            {
+                                let _ = handle.write(json.as_bytes()).await;
+                            }
+                        });
+
+                        #[cfg(not(target_arch = "wasm32"))]
+                        std::thread::spawn(move || {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .set_file_name("ramifi_export.json")
+                                .save_file()
+                            {
+                                let _ = std::fs::write(path, json);
+                            }
+                        });
+                    }
+
                     if ui.button("Manage Users").clicked() {
                         self.show_user_manager = true;
                     }
@@ -308,7 +423,7 @@ impl eframe::App for RamifiApp {
                                 .strong(),
                         ));
 
-                        if issue.from_index() != 0 {
+                        if issue.from_index() != 0 && issue.from_index() != usize::MAX {
                             let parent_display_id = issue.from_index() + 1;
                             if ui
                                 .link(format!("Forked from #{}", parent_display_id))
@@ -331,7 +446,7 @@ impl eframe::App for RamifiApp {
 
                             // Labels
                             egui::ScrollArea::horizontal()
-                                .id_source("header_labels_scroll")
+                                .id_salt("header_labels_scroll")
                                 .max_width(400.0)
                                 .show(ui, |ui| {
                                     ui.with_layout(
@@ -360,7 +475,7 @@ impl eframe::App for RamifiApp {
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
                             egui::ScrollArea::vertical()
-                                .id_source("main_scroll")
+                                .id_salt("main_scroll")
                                 .show(ui, |ui| {
                                     // Comments
                                     for comment in issue.comments().iter() {
@@ -437,7 +552,7 @@ impl eframe::App for RamifiApp {
                                                             self.issues.get_mut(id)
                                                     {
                                                         target.close_as_cmp();
-                                                        ui.close_menu();
+                                                        ui.close();
                                                     }
 
                                                     if ui.button("Close as Not Planned").clicked()
@@ -445,7 +560,7 @@ impl eframe::App for RamifiApp {
                                                             self.issues.get_mut(id)
                                                     {
                                                         target.close_as_not_planed();
-                                                        ui.close_menu();
+                                                        ui.close();
                                                     }
                                                     ui.separator();
                                                 } else {
@@ -455,7 +570,7 @@ impl eframe::App for RamifiApp {
                                                             self.issues.get_mut(id)
                                                     {
                                                         target.reopen();
-                                                        ui.close_menu();
+                                                        ui.close();
                                                     }
                                                     ui.separator();
                                                 }
@@ -465,7 +580,7 @@ impl eframe::App for RamifiApp {
                                                 {
                                                     self.filter_status = FilterStatus::All;
                                                     self.selected_issue_index = Some(new_id);
-                                                    ui.close_menu();
+                                                    ui.close();
                                                 }
                                             });
                                         },
@@ -487,6 +602,7 @@ impl eframe::App for RamifiApp {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {
     let native_opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -500,4 +616,38 @@ fn main() -> eframe::Result<()> {
         native_opts,
         Box::new(|cc| Ok(Box::new(RamifiApp::new(cc)))),
     )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    // Redirect `log` message to `console.log` and friends:
+    eframe::WebLogger::init(log::LevelFilter::Debug).ok();
+
+    std::panic::set_hook(Box::new(console_error_panic_hook::hook));
+
+    wasm_bindgen_futures::spawn_local(async {
+        let web_options = eframe::WebOptions::default();
+
+        let canvas = web_sys::window()
+            .and_then(|win| win.document())
+            .and_then(|doc| doc.get_element_by_id("the_canvas_id"))
+            .and_then(|element| element.dyn_into::<web_sys::HtmlCanvasElement>().ok())
+            .expect("failed to find canvas element with id 'the_canvas_id'");
+
+        if let Some(loading_text) = web_sys::window()
+            .and_then(|win| win.document())
+            .and_then(|doc| doc.get_element_by_id("center_text"))
+        {
+            loading_text.remove();
+        }
+
+        eframe::WebRunner::new()
+            .start(
+                canvas,
+                web_options,
+                Box::new(|cc| Ok(Box::new(RamifiApp::new(cc)))),
+            )
+            .await
+            .expect("failed to start eframe");
+    });
 }
