@@ -21,7 +21,7 @@ cp ./fork_notes.desktop "${NEWPATH}/fork_notes.desktop" &&\
 cp ./install.sh "${NEWPATH}/install.sh" &&\
 (
   cd "${RELEASE_DIR}"
-  zip -r "../${TAG}.zip" "${TAG}"
+  zip -r "${TAG}.zip" "${TAG}"
 )
 
 rm -rf "${NEWPATH}"
