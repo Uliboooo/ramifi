@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Fork Notes
+Comment=Fork Notes Issue Tracker
+Exec=/home/coyuki/Develop/fork_notes/target/release/fork_notes
+Icon=/home/coyuki/Develop/fork_notes/assets/icon.svg
+Terminal=false
+Type=Application
+Categories=Development;Utility;
+StartupNotify=true
