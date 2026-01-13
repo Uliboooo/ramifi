@@ -43,7 +43,7 @@ impl FilterStatus {
 // ----------------------------------------------------------------------------
 #[derive(Deserialize, Serialize)]
 #[serde(default)]
-struct RamifiApp {
+struct TreeNotesApp {
     issues: Issues,
     users: Users,
 
@@ -73,12 +73,12 @@ struct RamifiApp {
     current_user: User,
 
     #[serde(skip)]
-    import_rx: Option<Receiver<RamifiApp>>,
+    import_rx: Option<Receiver<TreeNotesApp>>,
     #[serde(skip)]
-    import_tx: Option<Sender<RamifiApp>>,
+    import_tx: Option<Sender<TreeNotesApp>>,
 }
 
-impl Default for RamifiApp {
+impl Default for TreeNotesApp {
     fn default() -> Self {
         let mut users = Users::new();
         let default_user = User::new("coyuki", "coyuki@example.com");
@@ -86,22 +86,6 @@ impl Default for RamifiApp {
         let current_user = default_user;
 
         let mut issues = Issues::new();
-
-        // --- 初期データ ---
-        let mut issue1 = Issue::new("GUI実装", current_user.clone(), vec!["Enhancement"]);
-        issue1.comment(Comment::new(
-            "eframeを使ってGUIを作る",
-            current_user.clone(),
-        ));
-        issues.add_new_issue(issue1);
-
-        let mut issue2 = Issue::new("永続化", current_user.clone(), vec!["Feature"]);
-        issue2.comment(Comment::new("データを保存する", current_user.clone()));
-        issues.add_new_issue(issue2);
-
-        let mut issue3 = Issue::new("UI改善", current_user.clone(), vec!["Design"]);
-        issue3.comment(Comment::new("見た目を良くする", current_user.clone()));
-        issues.add_new_issue(issue3);
 
         let (tx, rx) = channel();
 
@@ -115,7 +99,7 @@ impl Default for RamifiApp {
             comment_drafts: HashMap::new(),
             filter_status: FilterStatus::Open,
             query: String::new(),
-            selected_issue_index: Some(0),
+            selected_issue_index: None,
             current_user,
             import_rx: Some(rx),
             import_tx: Some(tx),
@@ -123,9 +107,34 @@ impl Default for RamifiApp {
     }
 }
 
-impl RamifiApp {
+impl TreeNotesApp {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn get_data_path() -> Option<std::path::PathBuf> {
+        let data_dir = if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+            std::path::PathBuf::from(xdg)
+        } else {
+            let home = std::env::var("HOME").ok()?;
+            std::path::PathBuf::from(home).join(".local").join("share")
+        };
+        Some(data_dir.join("tree_notes").join("data.json"))
+    }
+
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         Self::setup_custom_fonts(&cc.egui_ctx);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(path) = Self::get_data_path() {
+            if path.exists() {
+                if let Ok(content) = fs::read_to_string(&path) {
+                    if let Ok(mut app) = serde_json::from_str::<Self>(&content) {
+                        let (tx, rx) = channel();
+                        app.import_rx = Some(rx);
+                        app.import_tx = Some(tx);
+                        return app;
+                    }
+                }
+            }
+        }
 
         if let Some(storage) = cc.storage
             && let Some(json) = storage.get_string(eframe::APP_KEY)
@@ -189,10 +198,18 @@ impl RamifiApp {
 
 // ... existing App impl ...
 
-impl eframe::App for RamifiApp {
+impl eframe::App for TreeNotesApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         if let Ok(json) = serde_json::to_string(self) {
-            storage.set_string(eframe::APP_KEY, json);
+            storage.set_string(eframe::APP_KEY, json.clone());
+
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(path) = TreeNotesApp::get_data_path() {
+                if let Some(parent) = path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::write(path, json);
+            }
         }
     }
 
@@ -251,7 +268,7 @@ impl eframe::App for RamifiApp {
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("Ramifi Issue Tracker")
+                    egui::RichText::new("Tree Notes Issue Tracker")
                         .strong()
                         .size(16.0),
                 );
@@ -263,7 +280,7 @@ impl eframe::App for RamifiApp {
                         wasm_bindgen_futures::spawn_local(async move {
                             if let Some(file) = rfd::AsyncFileDialog::new().pick_file().await {
                                 let data = file.read().await;
-                                if let Ok(app) = serde_json::from_slice::<RamifiApp>(&data) {
+                                if let Ok(app) = serde_json::from_slice::<TreeNotesApp>(&data) {
                                     let _ = tx.send(app);
                                 }
                             }
@@ -273,7 +290,7 @@ impl eframe::App for RamifiApp {
                         std::thread::spawn(move || {
                             if let Some(path) = rfd::FileDialog::new().pick_file()
                                 && let Ok(content) = std::fs::read_to_string(path)
-                                && let Ok(app) = serde_json::from_str::<RamifiApp>(&content)
+                                && let Ok(app) = serde_json::from_str::<TreeNotesApp>(&content)
                             {
                                 let _ = tx.send(app);
                             }
@@ -286,7 +303,7 @@ impl eframe::App for RamifiApp {
                         #[cfg(target_arch = "wasm32")]
                         wasm_bindgen_futures::spawn_local(async move {
                             if let Some(handle) = rfd::AsyncFileDialog::new()
-                                .set_file_name("ramifi_export.json")
+                                .set_file_name("tree_notes_export.json")
                                 .save_file()
                                 .await
                             {
@@ -297,7 +314,7 @@ impl eframe::App for RamifiApp {
                         #[cfg(not(target_arch = "wasm32"))]
                         std::thread::spawn(move || {
                             if let Some(path) = rfd::FileDialog::new()
-                                .set_file_name("ramifi_export.json")
+                                .set_file_name("tree_notes_export.json")
                                 .save_file()
                             {
                                 let _ = std::fs::write(path, json);
@@ -322,8 +339,12 @@ impl eframe::App for RamifiApp {
 
                 // New Issue Input
                 ui.horizontal(|ui| {
-                    ui.text_edit_singleline(&mut self.new_description);
-                    if ui.button("New").clicked() && !self.new_description.is_empty() {
+                    let response = ui.text_edit_singleline(&mut self.new_description);
+                    if (ui.button("New").clicked()
+                        || (response.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter))))
+                        && !self.new_description.is_empty()
+                    {
                         let mut issue = Issue::new(
                             &self.new_description,
                             self.current_user.clone(),
@@ -336,6 +357,7 @@ impl eframe::App for RamifiApp {
                         let new_index = self.issues.add_new_issue(issue);
                         self.new_description.clear();
                         self.selected_issue_index = Some(new_index);
+                        response.request_focus();
                     }
                 });
 
@@ -612,9 +634,9 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "Ramifi",
+        "Tree Notes",
         native_opts,
-        Box::new(|cc| Ok(Box::new(RamifiApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(TreeNotesApp::new(cc)))),
     )
 }
 
@@ -645,7 +667,7 @@ fn main() {
             .start(
                 canvas,
                 web_options,
-                Box::new(|cc| Ok(Box::new(RamifiApp::new(cc)))),
+                Box::new(|cc| Ok(Box::new(TreeNotesApp::new(cc)))),
             )
             .await
             .expect("failed to start eframe");
